@@ -1,0 +1,115 @@
+import os
+import sys
+import socket
+import time
+import subprocess
+import platform
+import webbrowser
+import threading
+import ctypes
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+app = Flask(__name__)
+server_ip = "200.0.2.141"
+server_port = 7000
+listener_ip = "0.0.0.0"
+listener_port = 7001
+CORS(app, resources={r"/open": {"origins": f"http://{server_ip}:{server_port}"}})
+WEB_APP_URL = f"http://{server_ip}:{server_port}/login"
+
+system_platform = platform.system()
+
+if system_platform == "Windows":
+    user32 = ctypes.WinDLL("User32.dll")
+    OpenInputDesktop = user32.OpenInputDesktop
+    GetUserObjectInformationW = user32.GetUserObjectInformationW
+    CloseDesktop = user32.CloseDesktop
+    UOI_NAME = 2  # Constant to get desktop name
+
+def check_existing_instance(ip, port):
+    """Checks if an instance is already running on the given port."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((ip, port))
+    except OSError:
+        print(f"⚠️ Another instance is already running on port {port}. Exiting...")
+        sys.exit(1)  # Exit if port is in use
+    s.close()
+
+def is_screen_locked():
+    """Detect if the screen is locked on Windows, Linux, or macOS."""
+    try:
+        if system_platform == "Windows":
+            desktop_name = ctypes.create_unicode_buffer(256)
+            length = ctypes.c_ulong()
+            h_desktop = OpenInputDesktop(0, False, 0)
+            if not h_desktop:
+                return True  # Locked
+            success = GetUserObjectInformationW(h_desktop, UOI_NAME, desktop_name, ctypes.sizeof(desktop_name), ctypes.byref(length))
+            CloseDesktop(h_desktop)
+            return success and desktop_name.value.lower() == "winlogon"
+        
+        elif system_platform == "Linux":
+            result = subprocess.run(
+                "loginctl show-session $(loginctl | grep $(whoami) | awk '{print $1}') -p Locked",
+                shell=True, capture_output=True, text=True
+            )
+            return "Locked=yes" in result.stdout
+
+        elif system_platform == "Darwin":  # macOS
+            result = subprocess.run(
+                "ioreg -n Root -d1 | grep CGSSessionSecureInputPID",
+                shell=True, capture_output=True, text=True
+            )
+            return bool(result.stdout.strip())  # If output exists, screen is locked
+
+        return False  # Default to unlocked if unknown OS
+    except Exception as e:
+        print(f"Error detecting screen lock: {e}")
+        return False  # Assume unlocked if an error occurs
+
+def check_screen_lock():
+    """Continuously check if the screen is locked and exit if it is."""
+    try:
+        while True:
+            if is_screen_locked():
+                print("Screen is locked. Exiting...")
+                os._exit(0)
+            time.sleep(2)  # Check every 2 seconds
+    except Exception as e:
+        print(f"Error in screen lock checking thread: {e}")
+
+def open_web_app():
+    """Opens the web app in Google Chrome."""
+    webbrowser.open(WEB_APP_URL)
+
+@app.route('/open', methods=['POST'])
+def open_file():
+    data = request.json
+    file_path = data.get('file_path')
+
+    if not file_path or not os.path.exists(file_path):
+        return jsonify({"error": "Valid file_path is required"}), 400
+
+    try:
+        if system_platform == "Windows":
+            os.startfile(file_path)
+        elif system_platform == "Darwin":
+            subprocess.run(["open", file_path], check=True)
+        elif system_platform == "Linux":
+            subprocess.run(["xdg-open", file_path], check=True)
+        else:
+            return jsonify({"error": f"Unsupported OS: {system_platform}"}), 500
+
+        return jsonify({"message": f"Opened: {file_path}"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    threading.Thread(target=check_screen_lock, daemon=True).start()
+    print("Listener Ready!\nStarting Unicorn...")
+    threading.Thread(target=open_web_app, daemon=True).start()  # Now open the web app
+    time.sleep(2)
+    check_existing_instance(listener_ip, listener_port)  # Check for existing instance first
+    app.run(host=listener_ip, port=listener_port)
